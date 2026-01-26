@@ -1,3 +1,30 @@
+import os
+# 1. 强行设置 HTTP 代理为空，防止环境变量干扰
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
+
+import requests
+# 2. 伪装 User-Agent，让服务器以为我们是 Chrome 浏览器
+def get_user_agent():
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# 替换 akshare 内部可能用到的 requests headers (这是一种比较暴力的注入方式)
+_old_request = requests.Session.request
+def _new_request(self, method, url, *args, **kwargs):
+    headers = kwargs.get('headers', {})
+    if not headers: headers = {}
+    headers['User-Agent'] = get_user_agent()
+    kwargs['headers'] = headers
+    # 增加超时时间，防止数据传输一半被切断
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 30
+    return _old_request(self, method, url, *args, **kwargs)
+
+requests.Session.request = _new_request
+
+# --- 下面才是原来的 import ---
+import akshare as ak
+# ... (其余代码保持不变)
 import akshare as ak
 import pandas as pd
 import os
@@ -313,3 +340,4 @@ def run_task():
 
 if __name__ == "__main__":
     run_task()
+
