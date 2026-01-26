@@ -55,8 +55,6 @@ def check_stock_criteria(symbol, name, price, concept_name):
         
         # --- 关卡 1: 形态 (3连阳) ---
         last_3_days = recent.iloc[-3:]
-        # 严格要求：收盘价 >= 开盘价 (允许伪阴线，即涨幅>0但收盘<开盘? 不，这里只看阳线)
-        # 如果你觉得太严，可以改为 row['涨跌幅'] > 0
         is_uptrend = all(row['收盘'] >= row['开盘'] for _, row in last_3_days.iterrows())
         if not is_uptrend: return None, "❌ 形态(非3连阳)"
 
@@ -89,6 +87,7 @@ def check_stock_criteria(symbol, name, price, concept_name):
 
 def get_hot_stocks_pool(top_concepts, new_concepts):
     print(f"🎯 正在提取成分股...")
+    # 按照是否为新概念排序，确保去重时优先保留新概念标签
     sorted_concepts = sorted(top_concepts, key=lambda x: x[0] in new_concepts, reverse=True)
     
     all_dfs = []
@@ -103,7 +102,9 @@ def get_hot_stocks_pool(top_concepts, new_concepts):
             
     if not all_dfs: return []
     pool = pd.concat(all_dfs)
+    # 去重
     pool = pool.drop_duplicates(subset=['代码'], keep='first')
+    # 初筛: 涨跌幅 0~9.8%, 非ST
     pool = pool[(pool['涨跌幅'] > 0) & (pool['涨跌幅'] < 9.8) & (~pool['名称'].str.contains('ST|退'))]
     
     print(f"✅ 锁定 {len(pool)} 只潜力股 (已过滤涨停/跌绿/ST)")
@@ -156,7 +157,9 @@ def run_strict_selection(top_concepts, new_concepts):
     
     print("-" * 30)
     for reason, count in rejection_stats.most_common():
-        bar = "█" * int(count / total * 20)
+        # 简单的ASCII条形图
+        bar_len = int(count / total * 20) if total > 0 else 0
+        bar = "█" * bar_len
         print(f"{reason:<15} : {count:>3} {bar}")
     print("="*50 + "\n")
             
@@ -259,8 +262,13 @@ def run_task():
 
     history_data = {}
     if os.path.exists(HISTORY_FILE):
-        try: with open(HISTORY_FILE, 'r') as f: history_data = json.load(f)
-        except: pass
+        # --- 修复后的代码块 ---
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                history_data = json.load(f)
+        except:
+            pass
+        # ---------------------
     
     past_set = set()
     cutoff = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
