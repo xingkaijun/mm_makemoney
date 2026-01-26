@@ -42,11 +42,13 @@ def call_with_retry(func, max_retries=3, delay=1, *args, **kwargs):
             time.sleep(delay)
     return None
 
-# --- 3. 选股逻辑 (返回具体淘汰原因) ---
+# --- 3. 选股逻辑 (已修复接口) ---
 def check_stock_criteria(symbol, name, price, concept_name):
     try:
-        # 1. 获取K线
-        df_hist = call_with_retry(ak.stock_zh_a_hist_df_cf, symbol=symbol, adjust="qfq", period="daily")
+        # 1. 获取K线 (修复点：使用新接口 stock_zh_a_hist)
+        # 注意：start_date 不填默认就是最近的数据，我们只需要最近几天，所以不用管日期
+        df_hist = call_with_retry(ak.stock_zh_a_hist, symbol=symbol, period="daily", adjust="qfq")
+        
         if df_hist is None or len(df_hist) < 5: return None, "数据缺失"
         
         recent = df_hist.tail(4)
@@ -83,11 +85,11 @@ def check_stock_criteria(symbol, name, price, concept_name):
             "vol_ratio": round(vol_ratio, 2)
         }, "✅ 晋级"
     except Exception as e:
+        # 打印简短错误信息，方便调试
         return None, f"⚠️ 异常({str(e)})"
 
 def get_hot_stocks_pool(top_concepts, new_concepts):
     print(f"🎯 正在提取成分股...")
-    # 按照是否为新概念排序，确保去重时优先保留新概念标签
     sorted_concepts = sorted(top_concepts, key=lambda x: x[0] in new_concepts, reverse=True)
     
     all_dfs = []
@@ -102,17 +104,16 @@ def get_hot_stocks_pool(top_concepts, new_concepts):
             
     if not all_dfs: return []
     pool = pd.concat(all_dfs)
-    # 去重
     pool = pool.drop_duplicates(subset=['代码'], keep='first')
-    # 初筛: 涨跌幅 0~9.8%, 非ST
+    # 过滤掉涨跌幅异常的（涨停、跌停、ST）
     pool = pool[(pool['涨跌幅'] > 0) & (pool['涨跌幅'] < 9.8) & (~pool['名称'].str.contains('ST|退'))]
     
-    print(f"✅ 锁定 {len(pool)} 只潜力股 (已过滤涨停/跌绿/ST)")
+    print(f"✅ 锁定 {len(pool)} 只潜力股")
     return pool
 
 def run_strict_selection(top_concepts, new_concepts):
     selected_stocks = []
-    rejection_stats = Counter() # 统计淘汰原因
+    rejection_stats = Counter()
     
     candidates = get_hot_stocks_pool(top_concepts, new_concepts)
     
@@ -120,7 +121,6 @@ def run_strict_selection(top_concepts, new_concepts):
         print("❌ 热点股池为空")
         return []
 
-    # 扫描前 100 只
     check_list = candidates.head(100)
     total = len(check_list)
     
@@ -130,14 +130,11 @@ def run_strict_selection(top_concepts, new_concepts):
     
     for i, (_, row) in enumerate(check_list.iterrows()):
         try:
-            # 执行检查
             res, reason = check_stock_criteria(row['代码'], row['名称'], row['最新价'], row['所属板块'])
-            
-            # 记录统计
             rejection_stats[reason] += 1
             
-            # 打印进度条
             status_icon = "✨" if res else "  "
+            # 缩短日志长度，避免刷屏太快
             print(f"[{i+1}/{total}] {row['名称']}\t -> {reason} {status_icon}")
             
             if res:
@@ -146,18 +143,12 @@ def run_strict_selection(top_concepts, new_concepts):
             time.sleep(0.1)
         except: continue
 
-    # --- 打印淘汰漏斗报告 ---
     print("\n" + "="*50)
-    print("📊 淘汰原因统计报告 (Funnel Report)")
+    print("📊 淘汰原因统计")
     print("="*50)
-    if selected_stocks:
-        print(f"🎉 成功选出: {len(selected_stocks)} 只")
-    else:
-        print(f"😭 成功选出: 0 只 (全军覆没)")
-    
+    print(f"🎉 选中: {len(selected_stocks)} 只")
     print("-" * 30)
     for reason, count in rejection_stats.most_common():
-        # 简单的ASCII条形图
         bar_len = int(count / total * 20) if total > 0 else 0
         bar = "█" * bar_len
         print(f"{reason:<15} : {count:>3} {bar}")
@@ -182,12 +173,11 @@ def generate_html_report(today_str, new_concepts, top_concepts, picks):
                 <td>{s['vol_ratio']}</td>
             </tr>"""
     else:
-        stock_rows = "<tr><td colspan='4' style='text-align:center;color:#999;padding:30px'>今日无个股符合条件<br><small>请查看GitHub Actions日志获取淘汰详情</small></td></tr>"
+        stock_rows = "<tr><td colspan='4' style='text-align:center;color:#999;padding:30px'>今日无个股符合条件<br><small>请查看日志获取淘汰详情</small></td></tr>"
 
     concept_html = "".join([f'<span class="tag">{n}</span>' for n in new_concepts]) if new_concepts else '<span style="color:#999;font-size:12px">无新面孔</span>'
     top_html = "".join([f'<span class="tag tag-gray">{n}</span>' for n, _ in top_concepts])
 
-    # 历史链接逻辑
     history_links_html = ""
     if os.path.exists(ARCHIVE_DIR):
         files = sorted(glob.glob(f"{ARCHIVE_DIR}/*.html"), reverse=True)[:7]
@@ -262,13 +252,10 @@ def run_task():
 
     history_data = {}
     if os.path.exists(HISTORY_FILE):
-        # --- 修复后的代码块 ---
         try:
             with open(HISTORY_FILE, 'r') as f:
                 history_data = json.load(f)
-        except:
-            pass
-        # ---------------------
+        except: pass
     
     past_set = set()
     cutoff = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
