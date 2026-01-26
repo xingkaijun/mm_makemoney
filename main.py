@@ -1,30 +1,3 @@
-import os
-# 1. 强行设置 HTTP 代理为空，防止环境变量干扰
-os.environ['HTTP_PROXY'] = ''
-os.environ['HTTPS_PROXY'] = ''
-
-import requests
-# 2. 伪装 User-Agent，让服务器以为我们是 Chrome 浏览器
-def get_user_agent():
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# 替换 akshare 内部可能用到的 requests headers (这是一种比较暴力的注入方式)
-_old_request = requests.Session.request
-def _new_request(self, method, url, *args, **kwargs):
-    headers = kwargs.get('headers', {})
-    if not headers: headers = {}
-    headers['User-Agent'] = get_user_agent()
-    kwargs['headers'] = headers
-    # 增加超时时间，防止数据传输一半被切断
-    if 'timeout' not in kwargs:
-        kwargs['timeout'] = 30
-    return _old_request(self, method, url, *args, **kwargs)
-
-requests.Session.request = _new_request
-
-# --- 下面才是原来的 import ---
-import akshare as ak
-# ... (其余代码保持不变)
 import akshare as ak
 import pandas as pd
 import os
@@ -44,6 +17,7 @@ HISTORY_FILE = 'concept_history.json'
 ARCHIVE_DIR = 'archive'
 HTML_FILE = 'index.html'
 
+# --- 2. 基础工具函数 ---
 def send_telegram_message(message):
     """发送消息到 Telegram"""
     if not TG_BOT_TOKEN or not TG_CHAT_IDS: 
@@ -66,22 +40,15 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"❌ 推送失败 ({chat_id}): {e}")
 
-# --- 2. 网络请求重试装饰器 (新增核心修复) ---
 def call_with_retry(func, max_retries=3, delay=2, *args, **kwargs):
-    """
-    尝试调用接口，如果失败则等待后重试。
-    解决 'RemoteDisconnected' 问题。
-    """
+    """网络请求重试装饰器"""
     for i in range(max_retries):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            # 如果是最后一次尝试，打印错误并放弃
             if i == max_retries - 1:
                 print(f"⚠️ 接口调用最终失败 [{func.__name__}]: {e}")
                 return None
-            
-            # 等待一段时间后重试 (指数避退: 2s, 4s, 8s)
             wait_time = delay * (2 ** i)
             print(f"🔄 网络波动，正在第 {i+1} 次重试 (等待 {wait_time}s)...")
             time.sleep(wait_time)
@@ -90,7 +57,7 @@ def call_with_retry(func, max_retries=3, delay=2, *args, **kwargs):
 # --- 3. 选股核心逻辑 ---
 def check_stock_criteria(symbol, name, dde_now):
     try:
-        # 使用重试机制获取历史数据
+        # 获取个股历史行情
         df = call_with_retry(ak.stock_zh_a_hist_df_cf, symbol=symbol, adjust="qfq", period="daily")
         
         if df is None or len(df) < 5: return None
@@ -108,22 +75,21 @@ def check_stock_criteria(symbol, name, dde_now):
         cum_rise = last_3_days['涨跌幅'].sum()
         if cum_rise >= 10: return None
 
-        # C. 温和放量 (放宽一点判断，避免数据精度问题)
+        # C. 温和放量 (放宽到3倍)
         vol_today = today['成交量']
         vol_yest = yesterday['成交量']
         if vol_today <= vol_yest: return None 
-        if vol_today > (vol_yest * 3.0): return None # 放宽到3倍防止误杀
+        if vol_today > (vol_yest * 3.0): return None 
 
-        # D. 资金流入
+        # D. 3天资金净流入 (查个股流向)
         try:
             market = "sh" if symbol.startswith("6") else "sz"
-            # 使用重试机制获取资金流
             df_flow = call_with_retry(ak.stock_individual_fund_flow, stock=symbol, market=market)
             if df_flow is not None:
                 flow_sum = df_flow.tail(3)['主力净流入'].sum()
                 if flow_sum <= 0: return None
             else:
-                return None # 获取失败则保守跳过
+                return None
         except:
             return None 
 
@@ -136,44 +102,75 @@ def check_stock_criteria(symbol, name, dde_now):
             "mkt_cap": 0 
         }
     except Exception as e:
-        # print(f"个股分析错误 {symbol}: {e}")
         return None
 
 def run_strict_selection():
-    print("🔍 开始执行严选扫描 (增加重试机制，速度会稍慢)...")
+    print("🔍 开始执行严选扫描 (正在合并行情与资金流数据)...")
     selected_stocks = []
     
-    # 1. 全市场快照 (这个接口最大，最容易断，必须重试)
-    df_spot = call_with_retry(ak.stock_zh_a_spot_em, max_retries=5)
-    
-    if df_spot is None:
-        print("❌ 无法获取全市场数据，任务终止")
-        return []
-
     try:
-        # 2. 初筛
+        # 1. 获取全市场行情 (包含市值、价格)
+        df_spot = call_with_retry(ak.stock_zh_a_spot_em, max_retries=5)
+        if df_spot is None:
+            print("❌ 无法获取行情数据")
+            return []
+
+        # 2. 获取全市场资金流向 (包含主力净流入)
+        # 注意：这里可能比较慢，也容易断，必须重试
+        df_flow = call_with_retry(ak.stock_individual_fund_flow_rank, indicator="今日", max_retries=5)
+        if df_flow is None:
+            print("❌ 无法获取资金流数据")
+            return []
+        
+        # 3. 数据清洗与合并
+        # df_flow 的列名通常是 "主力净流入-净额"，我们需要重命名方便处理
+        # 先找一下这一列叫什么，防止名字变动
+        flow_col = None
+        for col in df_flow.columns:
+            if "主力净流入" in col and "净额" in col:
+                flow_col = col
+                break
+        
+        if not flow_col:
+            print("❌ 在资金流数据中找不到 '主力净流入' 列")
+            return []
+
+        # 重命名并只保留需要的列
+        df_flow = df_flow[['代码', flow_col]].rename(columns={flow_col: '主力净流入'})
+        
+        # 合并两个表 (Inner Join，只保留两者都有的数据)
+        # df_spot 和 df_flow 都有 '代码' 列
+        df_merge = pd.merge(df_spot, df_flow, on='代码', how='inner')
+        
+        print(f"✅ 数据合并完成，共 {len(df_merge)} 只股票，开始筛选...")
+
+        # 4. 初筛逻辑
+        # 排除 ST, 排除无数据
         mask = (
-            (~df_spot['名称'].str.contains('ST|退')) & 
-            (df_spot['主力净流入'].notnull()) & 
-            (df_spot['流通市值'] > 0)
+            (~df_merge['名称'].str.contains('ST|退')) & 
+            (df_merge['主力净流入'].notnull()) & 
+            (df_merge['流通市值'] > 0)
         )
-        df_spot = df_spot[mask].copy()
+        pool = df_merge[mask].copy()
         
-        df_spot['DDE'] = (df_spot['主力净流入'] / df_spot['流通市值']) * 100
+        # 计算 DDE: 主力净流入 / 流通市值 * 100
+        pool['DDE'] = (pool['主力净流入'] / pool['流通市值']) * 100
         
-        pool = df_spot[
-            (df_spot['DDE'] > 0.5) & 
-            (df_spot['涨跌幅'] > 0) & 
-            (df_spot['涨跌幅'] < 8)
-        ].copy()
+        # 筛选: DDE > 0.5, 涨幅 > 0, 涨幅 < 8
+        pool = pool[
+            (pool['DDE'] > 0.5) & 
+            (pool['涨跌幅'] > 0) & 
+            (pool['涨跌幅'] < 8)
+        ]
         
+        # 按市值排序
         pool = pool.sort_values(by='总市值', ascending=True)
         
-        # 限制数量，防止超时
-        check_list = pool.head(60) 
-        print(f"✅ 初筛通过 {len(check_list)} 只，开始深度扫描...")
-        
-        # 3. 深度扫描
+        # 取前 60 个进入深度扫描
+        check_list = pool.head(60)
+        print(f"✅ 初筛通过 {len(check_list)} 只，进入深度扫描...")
+
+        # 5. 深度扫描
         for _, row in check_list.iterrows():
             res = check_stock_criteria(row['代码'], row['名称'], row['DDE'])
             if res:
@@ -181,15 +178,18 @@ def run_strict_selection():
                 selected_stocks.append(res)
                 print(f"🌟 命中: {row['名称']}")
             
-            # 增加随机延时 (0.5 ~ 1.0秒)，降低被封概率
-            time.sleep(random.uniform(0.5, 1.0))
+            # 随机延时防封
+            time.sleep(random.uniform(0.5, 0.8))
             
     except Exception as e:
-        print(f"❌ 选股逻辑内部错误: {e}")
+        print(f"❌ 选股逻辑严重错误: {e}")
+        # 打印一下出错时的列名，方便调试
+        try: print(f"DEBUG: Spot Cols: {df_spot.columns[:5]}")
+        except: pass
         
     return selected_stocks
 
-# --- 4. 网页生成 & 归档 (保持不变) ---
+# --- 4. 网页生成 (含名字) ---
 def generate_html_report(today_str, new_concepts, top_concepts, picks):
     if picks:
         stock_rows = ""
@@ -261,7 +261,7 @@ def generate_html_report(today_str, new_concepts, top_concepts, picks):
                 <tbody>{stock_rows}</tbody>
             </table>
             {history_links_html}
-            <div class="footer">Data by AkShare | Auto-generated</div>
+            <div class="footer">Data by AkShare | Designed by Kevin Xing</div>
         </div>
     </body>
     </html>
@@ -273,21 +273,22 @@ def run_task():
     today_str = datetime.now().strftime('%Y-%m-%d')
     print(f"🚀 任务启动: {today_str}")
 
-    # A. 获取板块数据 (也加上重试)
+    # A. 获取板块数据 (含过滤逻辑)
     top_concepts = []
     try:
         df_concept = call_with_retry(ak.stock_board_concept_name_em)
         if df_concept is not None:
-            df_concept = df_concept.sort_values('涨跌幅', ascending=False).head(10)
-            top_concepts = list(zip(df_concept['板块名称'], df_concept['涨跌幅']))
+            df_concept = df_concept.sort_values('涨跌幅', ascending=False)
+            ignore_keywords = '涨停|连板'
+            df_concept = df_concept[~df_concept['板块名称'].str.contains(ignore_keywords)]
+            top_concepts = list(zip(df_concept.head(10)['板块名称'], df_concept.head(10)['涨跌幅']))
     except Exception as e:
         print(f"板块数据获取失败: {e}")
 
-    # B. 读取并对比历史
+    # B. 历史对比
     history_data = {}
     if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r') as f: history_data = json.load(f)
+        try: with open(HISTORY_FILE, 'r') as f: history_data = json.load(f)
         except: pass
     
     past_set = set()
@@ -301,29 +302,22 @@ def run_task():
     # C. 执行选股
     picks = run_strict_selection()
 
-    # D. 生成并保存网页
-    if not os.path.exists(ARCHIVE_DIR):
-        os.makedirs(ARCHIVE_DIR)
-    
+    # D. 归档处理
+    if not os.path.exists(ARCHIVE_DIR): os.makedirs(ARCHIVE_DIR)
     html_content = generate_html_report(today_str, new_concepts, top_concepts, picks)
     
-    archive_path = f"{ARCHIVE_DIR}/{today_str}.html"
-    with open(archive_path, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    with open(HTML_FILE, 'w', encoding='utf-8') as f:
-        f.write(html_content)
+    with open(f"{ARCHIVE_DIR}/{today_str}.html", 'w', encoding='utf-8') as f: f.write(html_content)
+    with open(HTML_FILE, 'w', encoding='utf-8') as f: f.write(html_content)
 
-    # E. 发送 Telegram
+    # E. 推送消息
     msg_lines = [f"📊 *A股复盘日报* ({today_str})"]
     if new_concepts: msg_lines.append(f"🔥 *新风口*: {', '.join(new_concepts)}")
     else: msg_lines.append("👀 无新风口，老热点轮动")
     
     if picks:
         msg_lines.append(f"\n💎 *严选出 {len(picks)} 只潜力股*")
-        for s in picks[:3]:
-            msg_lines.append(f"• {s['name']} (DDE:{s['dde']})")
-        if len(picks) > 3:
-            msg_lines.append(f"...更多请看网页")
+        for s in picks[:3]: msg_lines.append(f"• {s['name']} (DDE:{s['dde']})")
+        if len(picks) > 3: msg_lines.append(f"...更多请看网页")
     else:
         msg_lines.append("\n🍵 今日无符合严苛条件的个股")
 
@@ -332,12 +326,10 @@ def run_task():
     
     send_telegram_message("\n".join(msg_lines))
 
-    # F. 更新历史数据
+    # F. 保存历史
     if top_concepts:
         history_data[today_str] = [x[0] for x in top_concepts]
-        with open(HISTORY_FILE, 'w') as f:
-            json.dump(history_data, f)
+        with open(HISTORY_FILE, 'w') as f: json.dump(history_data, f)
 
 if __name__ == "__main__":
     run_task()
-
