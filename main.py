@@ -40,124 +40,115 @@ def call_with_retry(func, max_retries=3, delay=2, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             if i == max_retries - 1:
-                print(f"⚠️ 接口失败 [{func.__name__}]: {e}")
+                # 某些接口偶尔报错很正常，不用打印太惊悚的日志
                 return None
-            time.sleep(delay * (2 ** i))
+            time.sleep(delay)
     return None
 
-# --- 3. 选股逻辑 ---
+# --- 3. 选股逻辑 (带调试输出) ---
 def check_stock_criteria(symbol, name, price, current_change):
     """
-    对单只股票进行深度扫描 (K线 + 资金流)
+    返回: (ResultDict, ReasonString)
+    ResultDict: 成功时返回字典，失败时返回 None
+    ReasonString: 失败的具体原因
     """
     try:
-        # 1. 资金流检查 (最耗时，先查这个，如果主力没流进就直接pass，省去查K线的时间)
-        # 注意：这里我们用个股流向接口，而不是全市场的大表
+        # 1. 资金流检查
         market = "sh" if symbol.startswith("6") else "sz"
         df_flow = call_with_retry(ak.stock_individual_fund_flow, stock=symbol, market=market)
         
-        if df_flow is None or df_flow.empty: return None
+        if df_flow is None or df_flow.empty: 
+            return None, "获取资金流失败"
         
-        # 检查3日主力净流入
         recent_flow = df_flow.tail(3)
         flow_sum = recent_flow['主力净流入'].sum()
-        if flow_sum <= 0: return None # 资金流出，淘汰
+        if flow_sum <= 0: 
+            return None, "3日资金净流出"
 
-        # 计算 DDE (近似值: 净流入/大致流通盘)
-        # 这里的 DDE 计算比较粗略，因为没有实时流通市值，但只要资金是正的就行
-        # 我们用流入力度代替 DDE 展示
-        
         # 2. 历史K线检查
         df_hist = call_with_retry(ak.stock_zh_a_hist_df_cf, symbol=symbol, adjust="qfq", period="daily")
-        if df_hist is None or len(df_hist) < 5: return None
+        if df_hist is None or len(df_hist) < 5: 
+            return None, "K线数据不足"
         
         recent = df_hist.tail(4)
         today = recent.iloc[-1]
         yesterday = recent.iloc[-2]
         
-        # A. 连续3天上涨 (收盘价抬升 且 为阳线)
+        # A. 连续3天上涨
         last_3_days = recent.iloc[-3:]
         is_uptrend = all(row['收盘'] >= row['开盘'] for _, row in last_3_days.iterrows())
-        if not is_uptrend: return None
+        if not is_uptrend: 
+            return None, "非连续3日阳线"
 
-        # B. 3天累计涨幅 < 15% (稍微放宽一点，避免漏掉强势股)
+        # B. 3天累计涨幅 < 15%
         cum_rise = last_3_days['涨跌幅'].sum()
-        if cum_rise >= 15: return None
+        if cum_rise >= 15: 
+            return None, f"涨幅过大({cum_rise:.1f}%)"
 
         # C. 温和放量
         vol_today = today['成交量']
         vol_yest = yesterday['成交量']
-        if vol_today <= vol_yest: return None 
-        if vol_today > (vol_yest * 3.5): return None # 放宽倍数
+        if vol_today <= vol_yest: return None, "今日缩量"
+        if vol_today > (vol_yest * 3.5): return None, "今日爆量(>3.5倍)"
 
-        # 通过所有检查
+        # 成功
         return {
             "name": name,
             "symbol": symbol,
             "cum_rise": round(cum_rise, 2),
             "price": price,
-            "dde": round(flow_sum / 10000000, 2), # 这里展示主力净流入(千万)
-            "mkt_cap": "热点成分" # 暂时无法获取实时市值，用标签代替
-        }
-    except:
-        return None
+            "dde": round(flow_sum / 10000000, 2),
+            "mkt_cap": "热点成分"
+        }, "OK"
+    except Exception as e:
+        return None, f"异常: {str(e)}"
 
 def get_hot_stocks_pool(top_concepts):
-    """
-    策略核心：只获取【Top10概念板块】里的成分股
-    """
     print(f"🎯 正在从 {len(top_concepts)} 个热点板块中提取成分股...")
     pool = pd.DataFrame()
-    
     for concept_name, _ in top_concepts:
         try:
-            # 获取该板块的成分股
             df = call_with_retry(ak.stock_board_concept_cons_em, symbol=concept_name)
             if df is not None and not df.empty:
                 pool = pd.concat([pool, df])
-            time.sleep(1) # 稍微歇一下
-        except:
-            continue
+            time.sleep(0.5)
+        except: continue
             
     if pool.empty: return []
-
-    # 数据清洗
-    # 不同的接口返回列名可能不同，通常是 '代码', '名称', '最新价', '涨跌幅'
-    pool = pool.drop_duplicates(subset=['代码']) # 去重
-    
-    # 初筛：只要涨幅 > 0 且 < 8% 的 (未涨停，且是红盘)
-    pool = pool[
-        (pool['涨跌幅'] > 0) & 
-        (pool['涨跌幅'] < 8) & 
-        (~pool['名称'].str.contains('ST|退'))
-    ]
+    pool = pool.drop_duplicates(subset=['代码'])
+    pool = pool[(pool['涨跌幅'] > 0) & (pool['涨跌幅'] < 8) & (~pool['名称'].str.contains('ST|退'))]
     
     print(f"✅ 提取并初筛完成，共锁定 {len(pool)} 只热点潜力股")
     return pool
 
 def run_strict_selection(top_concepts):
-    """执行扫描"""
     selected_stocks = []
-    
-    # 1. 获取热点池 (大大缩小范围)
     candidates = get_hot_stocks_pool(top_concepts)
     
     if len(candidates) == 0:
         print("❌ 未能获取热点股池")
         return []
 
-    print("🔍 开始深度扫描热点股...")
+    print("🔍 开始深度扫描热点股 (显示前50条日志)...")
     
-    # 2. 限制扫描数量 (为了防止超时，只看前 80 个)
-    # 优先看涨幅适中的
+    # 限制扫描数量，防止超时
     check_list = candidates.head(80)
+    total = len(check_list)
 
-    for _, row in check_list.iterrows():
+    for i, (_, row) in enumerate(check_list.iterrows()):
         try:
-            res = check_stock_criteria(row['代码'], row['名称'], row['最新价'], row['涨跌幅'])
+            # 这里的 print 是关键，让你知道它在动
+            log_prefix = f"[{i+1}/{total}] {row['名称']}: "
+            
+            res, reason = check_stock_criteria(row['代码'], row['名称'], row['最新价'], row['涨跌幅'])
+            
             if res:
                 selected_stocks.append(res)
-                print(f"🌟 命中: {row['名称']}")
+                print(f"{log_prefix}🌟 命中！")
+            else:
+                # 这里的日志会告诉你为什么没选上
+                print(f"{log_prefix}淘汰 ({reason})")
+                
             time.sleep(0.5)
         except:
             continue
@@ -177,7 +168,7 @@ def generate_html_report(today_str, new_concepts, top_concepts, picks):
                 <td>{s['mkt_cap']}</td>
             </tr>"""
     else:
-        stock_rows = "<tr><td colspan='4' style='text-align:center;color:#999'>今日热点板块中无符合严选条件的个股</td></tr>"
+        stock_rows = "<tr><td colspan='4' style='text-align:center;color:#999;padding:20px'>今日热点板块中无符合严选条件的个股</td></tr>"
 
     concept_html = "".join([f'<span class="tag">{n}</span>' for n in new_concepts]) if new_concepts else '<span style="color:#999;font-size:12px">无新面孔</span>'
     top_html = "".join([f'<span class="tag tag-gray">{n}</span>' for n, _ in top_concepts])
@@ -202,7 +193,7 @@ def generate_html_report(today_str, new_concepts, top_concepts, picks):
         <title>A股复盘 {today_str}</title>
         <style>
             body {{ font-family: -apple-system, sans-serif; background: #f0f2f5; padding: 15px; margin: 0; }}
-            .container {{ max_width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }}
+            .container {{ max_width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; }}
             h1 {{ font-size: 20px; text-align: center; color: #333; }}
             h2 {{ font-size: 16px; border-left: 4px solid #e74c3c; padding-left: 10px; margin-top: 25px; }}
             .tag {{ display: inline-block; background: #ffe2e2; color: #e74c3c; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin: 0 5px 5px 0; }}
@@ -244,7 +235,6 @@ def run_task():
     today_str = datetime.now().strftime('%Y-%m-%d')
     print(f"🚀 启动: {today_str}")
 
-    # A. 获取板块
     top_concepts = []
     try:
         df = call_with_retry(ak.stock_board_concept_name_em)
@@ -255,7 +245,6 @@ def run_task():
     except:
         print("板块获取失败")
 
-    # B. 历史对比
     history_data = {}
     if os.path.exists(HISTORY_FILE):
         try:
@@ -269,31 +258,29 @@ def run_task():
     
     new_concepts = [n for n, r in top_concepts if n not in past_set]
 
-    # C. 执行【热点聚焦】选股
-    # 注意：这里我们把 top_concepts 传进去，只扫描这些板块里的股票
+    # 执行选股
     picks = run_strict_selection(top_concepts)
 
-    # D. 归档
     if not os.path.exists(ARCHIVE_DIR): os.makedirs(ARCHIVE_DIR)
     html = generate_html_report(today_str, new_concepts, top_concepts, picks)
     with open(f"{ARCHIVE_DIR}/{today_str}.html", 'w', encoding='utf-8') as f: f.write(html)
     with open(HTML_FILE, 'w', encoding='utf-8') as f: f.write(html)
 
-    # E. 推送
+    # 发送 Telegram (确保无论有没有结果都发)
     msg = [f"📊 *A股复盘* ({today_str})"]
     if new_concepts: msg.append(f"🔥 *新风口*: {', '.join(new_concepts)}")
     
     if picks:
         msg.append(f"\n💎 *热点严选 {len(picks)} 只*")
         for s in picks[:3]: msg.append(f"• {s['name']} (流入:{s['dde']}千万)")
+        if len(picks) > 3: msg.append(f"...更多见网页")
     else:
-        msg.append("\n🍵 今日热点板块内无严选个股")
+        msg.append("\n🍵 热点板块内无严选个股 (条件可能太严)")
 
     if PAGE_URL_PREFIX: msg.append(f"\n🔗 [查看完整日报]({PAGE_URL_PREFIX})")
     
     send_telegram_message("\n".join(msg))
 
-    # F. 保存
     if top_concepts:
         history_data[today_str] = [x[0] for x in top_concepts]
         with open(HISTORY_FILE, 'w') as f: json.dump(history_data, f)
