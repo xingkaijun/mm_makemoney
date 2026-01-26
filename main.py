@@ -123,8 +123,6 @@ def run_strict_selection():
             return []
         
         # 3. 数据清洗与合并
-        # df_flow 的列名通常是 "主力净流入-净额"，我们需要重命名方便处理
-        # 先找一下这一列叫什么，防止名字变动
         flow_col = None
         for col in df_flow.columns:
             if "主力净流入" in col and "净额" in col:
@@ -138,14 +136,12 @@ def run_strict_selection():
         # 重命名并只保留需要的列
         df_flow = df_flow[['代码', flow_col]].rename(columns={flow_col: '主力净流入'})
         
-        # 合并两个表 (Inner Join，只保留两者都有的数据)
-        # df_spot 和 df_flow 都有 '代码' 列
+        # 合并两个表 (Inner Join)
         df_merge = pd.merge(df_spot, df_flow, on='代码', how='inner')
         
         print(f"✅ 数据合并完成，共 {len(df_merge)} 只股票，开始筛选...")
 
         # 4. 初筛逻辑
-        # 排除 ST, 排除无数据
         mask = (
             (~df_merge['名称'].str.contains('ST|退')) & 
             (df_merge['主力净流入'].notnull()) & 
@@ -153,20 +149,16 @@ def run_strict_selection():
         )
         pool = df_merge[mask].copy()
         
-        # 计算 DDE: 主力净流入 / 流通市值 * 100
         pool['DDE'] = (pool['主力净流入'] / pool['流通市值']) * 100
         
-        # 筛选: DDE > 0.5, 涨幅 > 0, 涨幅 < 8
         pool = pool[
             (pool['DDE'] > 0.5) & 
             (pool['涨跌幅'] > 0) & 
             (pool['涨跌幅'] < 8)
         ]
         
-        # 按市值排序
         pool = pool.sort_values(by='总市值', ascending=True)
         
-        # 取前 60 个进入深度扫描
         check_list = pool.head(60)
         print(f"✅ 初筛通过 {len(check_list)} 只，进入深度扫描...")
 
@@ -178,12 +170,10 @@ def run_strict_selection():
                 selected_stocks.append(res)
                 print(f"🌟 命中: {row['名称']}")
             
-            # 随机延时防封
             time.sleep(random.uniform(0.5, 0.8))
             
     except Exception as e:
         print(f"❌ 选股逻辑严重错误: {e}")
-        # 打印一下出错时的列名，方便调试
         try: print(f"DEBUG: Spot Cols: {df_spot.columns[:5]}")
         except: pass
         
@@ -285,11 +275,14 @@ def run_task():
     except Exception as e:
         print(f"板块数据获取失败: {e}")
 
-    # B. 历史对比
+    # B. 历史对比 (已修复缩进语法错误)
     history_data = {}
     if os.path.exists(HISTORY_FILE):
-        try: with open(HISTORY_FILE, 'r') as f: history_data = json.load(f)
-        except: pass
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                history_data = json.load(f)
+        except:
+            pass
     
     past_set = set()
     cutoff_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
@@ -303,11 +296,15 @@ def run_task():
     picks = run_strict_selection()
 
     # D. 归档处理
-    if not os.path.exists(ARCHIVE_DIR): os.makedirs(ARCHIVE_DIR)
+    if not os.path.exists(ARCHIVE_DIR):
+        os.makedirs(ARCHIVE_DIR)
+        
     html_content = generate_html_report(today_str, new_concepts, top_concepts, picks)
     
-    with open(f"{ARCHIVE_DIR}/{today_str}.html", 'w', encoding='utf-8') as f: f.write(html_content)
-    with open(HTML_FILE, 'w', encoding='utf-8') as f: f.write(html_content)
+    with open(f"{ARCHIVE_DIR}/{today_str}.html", 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    with open(HTML_FILE, 'w', encoding='utf-8') as f:
+        f.write(html_content)
 
     # E. 推送消息
     msg_lines = [f"📊 *A股复盘日报* ({today_str})"]
@@ -329,7 +326,8 @@ def run_task():
     # F. 保存历史
     if top_concepts:
         history_data[today_str] = [x[0] for x in top_concepts]
-        with open(HISTORY_FILE, 'w') as f: json.dump(history_data, f)
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history_data, f)
 
 if __name__ == "__main__":
     run_task()
