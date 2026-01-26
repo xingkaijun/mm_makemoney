@@ -1,0 +1,45 @@
+name: A股日报自动运行
+
+on:
+  schedule:
+    # 北京时间 14:00 (UTC 06:00) 周一到周五
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch: # 允许手动点按钮运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Monitor Script
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+          # 这里引用 Secrets 里的 PAGE_URL，方便你以后修改
+          PAGE_URL_PREFIX: ${{ secrets.PAGE_URL_PREFIX }}
+        run: |
+          python main.py
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          # 添加所有变动：包括 JSON历史, 首页 HTML, 和 归档文件夹
+          git add concept_history.json index.html archive/
+          # 如果没有变化则不报错
+          git commit -m "Auto update daily report" || echo "No changes to commit"
+          git push
